@@ -74,6 +74,9 @@ class Project(unittest.TestCase):
             del sys.modules[name]
         cadcache.core.settings.root = None
         cadcache.core.settings.cache_dir = None
+        cadcache.core.settings.salt = None
+        cadcache.core.settings.before_save = None
+        cadcache.core.settings.attributes = ()
         warnings.resetwarnings()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -507,6 +510,258 @@ class Inputs(Project):
         self.assertNotEqual(m.roller.key(load_requirements(spec)), k)
         spec.write_text(text.replace("30", "32"))
         self.assertNotEqual(m.roller.key(load_requirements(spec)), k)
+
+
+class Hooks(Project):
+    def test_salt_changes_every_key(self):
+        m = self.module(PARTS)
+        k = m.block.key(10)
+        cadcache.configure(salt={"app": "1.0", "quality": "normal"})
+        k2 = m.block.key(10)
+        self.assertNotEqual(k, k2)
+        self.assertEqual(m.block.key(10), k2)
+        cadcache.configure(salt={"app": "1.1", "quality": "normal"})
+        self.assertNotEqual(m.block.key(10), k2)
+        with self.assertRaises(TypeError):
+            cadcache.configure(salt=object())
+
+    def test_before_save_mesh_is_kept_in_the_brep(self):
+        from OCP.BRepMesh import BRepMesh_IncrementalMesh
+        from OCP.BRepTools import BRepTools
+        seen = []
+
+        def tessellate(shape):
+            seen.append(shape)
+            BRepMesh_IncrementalMesh(shape.wrapped, 0.5, True, 0.3, True)
+
+        cadcache.configure(before_save=tessellate)
+        m = self.module(PARTS)
+        built = m.peg(4)
+        cached = m.peg(4)
+        self.assertEqual(len(seen), 1)           # only on a build
+        for shape in (built, cached):
+            self.assertTrue(BRepTools.Triangulation_s(shape.wrapped, 0.5))
+
+    def test_attributes_are_kept(self):
+        src = '''
+            from build123d import Box, Compound, Location
+            from cadcache import part
+
+            @part
+            def kit(n):
+                kids = []
+                for i in range(n):
+                    b = Box(1, 1, 1).moved(Location((2 * i, 0, 0)))
+                    b.bom = {"item": i, "tags": ["steel"]}
+                    b.unkept = object()
+                    kids.append(b)
+                c = Compound(children=kids)
+                c.bom = {"item": "kit"}
+                return c
+            '''
+        cadcache.configure(attributes=["bom", "unkept"])
+        m = self.module(src)
+        m.kit(2)
+        for c in (m.kit(2), m.kit(2)):
+            self.assertEqual(c.bom, {"item": "kit"})
+            self.assertEqual([k.bom for k in c.children],
+                             [{"item": 0, "tags": ["steel"]},
+                              {"item": 1, "tags": ["steel"]}])
+            self.assertFalse(hasattr(c.children[0], "unkept"))
+        self.assertEqual(self.kinds(), {"kit": "cached"})
+
+    def test_old_sidecar_version_is_a_miss(self):
+        m = self.module(PARTS)
+        m.block(10)
+        brep, side = m.block.paths(10)
+        text = side.read_text(encoding="utf-8")
+        side.write_text(text.replace('"sidecar": 2', '"sidecar": 1'),
+                        encoding="utf-8")
+        cadcache.reset()
+        m.block(10)
+        self.assertEqual(self.kinds(), {"block": "built"})
+
+
+class NotCacheable(Project):
+    SRC = '''
+        from build123d import Box, Compound, Location
+        import cadcache
+        from cadcache import part
+
+        registry = []
+
+        @part
+        def registered(w):
+            b = Box(w, w, w)
+            registry.append(b)
+            cadcache.not_cacheable("registers itself")
+            return b
+
+        @part
+        def plain(w):
+            return Box(w, 1, 1)
+
+        @part
+        def outer(w):
+            return Compound(children=[registered(w),
+                                      plain(w).moved(Location((9, 0, 0)))])
+        '''
+
+    def test_result_is_returned_as_built_and_not_stored(self):
+        m = self.module(self.SRC)
+        a = m.registered(3)
+        self.assertIs(a, m.registry[0])          # the object it built
+        brep, side = m.registered.paths(3)
+        self.assertFalse(side.exists())
+        m.registered(3)
+        self.assertEqual(len(m.registry), 2)     # the effect happens again
+        events = cadcache.events()
+        self.assertEqual([e.kind for e in events],
+                         ["uncacheable", "uncacheable"])
+        self.assertEqual(events[0].reason, "registers itself")
+        self.assertRegex(events[0].part_number, PN)
+        self.assertIsNone(events[0].entry)
+
+    def test_outer_builds_are_not_stored_either(self):
+        m = self.module(self.SRC)
+        m.outer(2)
+        self.assertEqual(self.kinds(), {"registered": "uncacheable",
+                                        "plain": "built",
+                                        "outer": "uncacheable"})
+        m.outer(2)
+        self.assertEqual(self.kinds(), {"registered": "uncacheable",
+                                        "plain": "cached",
+                                        "outer": "uncacheable"})
+        self.assertEqual(len(m.registry), 2)
+
+    def test_outside_a_build_it_does_nothing(self):
+        cadcache.not_cacheable("nothing is building")
+
+
+PN = r"^[A-HJKMNP-TV-Z]{3}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{5}$"
+
+
+class PartNumbers(Project):
+    SRC = '''
+        from build123d import Box, Compound, Location
+        from cadcache import part
+
+        THICKNESS = 2
+
+        @part
+        def plate(w, h=10):
+            return Box(w, h, THICKNESS)
+
+        @part(part_class="plate-pair")
+        def pair(a, b):
+            return Compound(children=[a, b.moved(Location((0, 0, 5)))])
+        '''
+
+    def test_format_and_inputs(self):
+        m = self.module(self.SRC)
+        n = m.plate.part_number(30)
+        self.assertRegex(n, PN)
+        self.assertEqual(n, m.plate.part_number(w=30.0, h=10))
+        self.assertNotEqual(n, m.plate.part_number(31))
+        self.assertNotEqual(n, m.plate.part_number(30, h=11))
+        # The plain-data globals a part reads are inputs too.
+        m2 = self.module(self.SRC.replace("THICKNESS = 2", "THICKNESS = 3"))
+        self.assertNotEqual(m2.plate.part_number(30), n)
+
+    def test_a_refactor_keeps_the_number_but_rebuilds(self):
+        m = self.module(self.SRC)
+        n, k = m.plate.part_number(30), m.plate.key(30)
+        m2 = self.module(self.SRC.replace(
+            "return Box(w, h, THICKNESS)",
+            "size = (w, h, THICKNESS)\n            return Box(*size)"))
+        self.assertEqual(m2.plate.part_number(30), n)
+        self.assertNotEqual(m2.plate.key(30), k)
+
+    def test_events_shapes_and_sidecars_carry_it(self):
+        m = self.module(self.SRC)
+        built = m.plate(30)
+        cached = m.plate(30)
+        n = m.plate.part_number(30)
+        self.assertEqual([e.part_number for e in cadcache.events()], [n, n])
+        self.assertEqual(cadcache.part_number_of(built), n)
+        self.assertEqual(cadcache.part_number_of(cached), n)
+        # An instance placed elsewhere is still that part; a boolean
+        # result is a new shape.
+        self.assertEqual(cadcache.part_number_of(
+            cached.moved(Location((1, 0, 0)))), n)
+        self.assertIsNone(cadcache.part_number_of(cached - Box(1, 1, 9)))
+        self.assertIsNone(cadcache.part_number_of(Box(1, 1, 1)))
+        brep, side = m.plate.paths(30)
+        self.assertIn(n, side.read_text(encoding="utf-8"))
+        self.assertTrue(cadcache.events()[0].entry.endswith(".brep"))
+
+    def test_parts_passed_in_are_used_by_number(self):
+        m = self.module(self.SRC)
+        a, b = m.plate(30), m.plate(20)
+        n = m.pair.part_number(a, b)
+        self.assertEqual(n, m.pair.part_number(m.plate(30), m.plate(20)))
+        self.assertNotEqual(n, m.pair.part_number(m.plate(30), m.plate(21)))
+        self.assertNotEqual(n, m.pair.part_number(b, a))
+        # A part that has been moved is still an input, at its place.
+        moved = m.plate(20).moved(Location((1, 0, 0)))
+        self.assertNotEqual(n, m.pair.part_number(a, moved))
+        self.assertEqual(m.pair.part_class, "plate-pair")
+        self.assertEqual(m.plate.part_class, "plate")
+
+    def test_same_hash_as_partnum(self):
+        try:
+            import partnum
+        except ImportError:
+            self.skipTest("partnum not installed")
+        from cadcache import partnums
+        data = {"scheme": "pn/1", "class": "track-roller",
+                "parameters": {"Track_W_mm": 18.50, "name": " a  b ",
+                               "n": [1.0, 2, {"x": None, "y": True}]},
+                "uses": {"screw": "QPT-8D2K-4MMXA"}}
+        self.assertEqual(partnums.canonical(data), partnum.canonical(data))
+        self.assertEqual(partnums.number(data), partnum.part_number(data))
+
+
+class ExecutedScripts(Project):
+    """App runners exec() a script in a namespace that isn't a module."""
+    SRC = '''
+        from build123d import Box
+        from cadcache import part
+
+        def size(w):
+            return w * 2
+
+        @part
+        def block(w):
+            return Box(size(w), 1, 1)
+
+        result = block(3)
+        '''
+
+    def run_script(self, source):
+        path = self.root / "design.py"
+        path.write_text(textwrap.dedent(source), encoding="utf-8")
+        namespace = {"__name__": "__app_design__", "__file__": str(path)}
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"),
+             namespace)
+        return namespace
+
+    def test_helpers_in_the_script_are_keyed(self):
+        first = self.run_script(self.SRC)
+        self.assertAlmostEqual(first["result"].volume, 6)
+        self.run_script(self.SRC)
+        self.assertEqual([e.kind for e in cadcache.events()],
+                         ["built", "cached"])
+        cadcache.reset()
+        edited = self.run_script(self.SRC.replace("w * 2", "w * 3"))
+        self.assertEqual(self.kinds(), {"block": "built"})
+        self.assertAlmostEqual(edited["result"].volume, 9)
+
+    def test_default_root_is_the_scripts_folder(self):
+        cadcache.core.settings.root = None
+        namespace = self.run_script(self.SRC)
+        self.assertEqual(cadcache.keys.project_root(namespace["block"].fn),
+                         self.root.resolve())
 
 
 class Keys(unittest.TestCase):

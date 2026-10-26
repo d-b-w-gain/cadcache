@@ -36,7 +36,7 @@ from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path, PurePath
 
-FORMAT = 1
+FORMAT = 2
 
 
 class CacheWarning(UserWarning):
@@ -248,17 +248,40 @@ def module_root(module):
     return f.parent
 
 
-def _is_local(obj, root):
+def project_root(fn):
+    """The default project folder for a function: its module's project, or
+    the folder of the file it was compiled from."""
+    mod = sys.modules.get(getattr(fn, "__module__", None) or "")
+    root = module_root(mod) if mod else None
+    if root is None:
+        f = defined_in(fn)
+        if f and os.path.isfile(f):
+            root = Path(f).resolve().parent
+    return root
+
+
+def defined_in(obj):
+    """The file obj comes from: its module's file, or - for code run with
+    exec() in a namespace that isn't an imported module, as app runners
+    do - the file its own code was compiled from."""
     if isinstance(obj, types.ModuleType):
-        mod = obj
-    else:
-        mod = sys.modules.get(getattr(obj, "__module__", None) or "")
+        return getattr(obj, "__file__", None)
+    mod = sys.modules.get(getattr(obj, "__module__", None) or "")
     f = getattr(mod, "__file__", None)
+    if f:
+        return f
+    for code, _, _ in _codes(obj):
+        return code.co_filename
+    return None
+
+
+def _is_local(obj, root):
+    f = defined_in(obj)
     if not f or root is None or is_library_path(f):
         return False
     try:
         Path(f).resolve().relative_to(root)
-    except ValueError:
+    except (ValueError, OSError):
         return False
     return True
 
@@ -381,14 +404,15 @@ def _ignorable(value):
                               types.BuiltinFunctionType))
 
 
-def code_hash(fn, root=None, report=None):
+def code_hash(fn, root=None, report=None, global_values=None):
     """Hash of fn's code and everything it reaches in the project.
 
     report(kind, name, where), if given, is told about globals that hold
-    data ("global") and calls to OCCT file readers ("occt")."""
+    data ("global") and calls to OCCT file readers ("occt"). global_values,
+    if given, is filled with {name: value} for the data globals that
+    went into the hash (for part numbers, which leave code out)."""
     if root is None:
-        mod = sys.modules.get(fn.__module__)
-        root = module_root(mod) if mod else None
+        root = project_root(fn)
     hashes, data = {}, {}
     stack = [inspect.unwrap(fn)]
     while stack:
@@ -438,6 +462,8 @@ def code_hash(fn, root=None, report=None):
                     if report:
                         report("untracked", vname, name)
                     continue
+                if global_values is not None:
+                    global_values.setdefault(vname, v)
                 if report:
                     report("global", vname, name)
     return digest({"code": hashes, "globals": data}), sorted(hashes)

@@ -97,7 +97,8 @@ A part rebuilds when any of these change:
 - **plain-data globals** those functions read (with a warning, below);
 - **files the part read** while building, checked by content on every
   hit. A file a nested part read counts for the outer part too;
-- the **build123d version**, and `@part(version=N)` to force a rebuild by
+- the **build123d, OCP and Python versions**, the `salt` set with
+  `configure()` (below), and `@part(version=N)` to force a rebuild by
   hand.
 
 Arguments must be values cadcache can key: numbers, text, lists, tuples,
@@ -108,6 +109,27 @@ object with a `__cadcache_key__()` method. `register_key(cls, fn)` adds a
 type. Any other argument raises `TypeError` instead of being guessed at. A
 shape that came out of another part keys on that part's key, unless it has
 been moved since. Any other shape keys on its BREP.
+
+## Part numbers
+
+Every part call also gets a part number in partnum's format,
+`AAA-XXXX-XXXXX`, hashed the way partnum hashes a requirements file
+(scheme `pn/1`) from the part's **inputs only**: its arguments and the
+plain-data globals it reads. Parts passed in as arguments count by their
+own part numbers, like partnum's `uses:`. Code is left out, so a refactor
+rebuilds the part (its key changes) but keeps its number. Same inputs,
+same number, on any computer, with no registry.
+
+```python
+slide_roller.part_number(roller_req)     # without building anything
+cadcache.part_number_of(shape)           # of a shape a part returned
+[e.part_number for e in cadcache.events()]
+```
+
+A moved or copied instance keeps its part's number; a boolean result is a
+new shape and has none. The class it is hashed under is the function's
+name with hyphens (`slide-roller`); `@part(part_class="roller")` sets it.
+partnum doesn't need to be installed for this.
 
 ## Keyed on a partnum requirements file
 
@@ -150,7 +172,30 @@ cadcache.configure(cache_dir=..., root=..., enabled=...)
 
 `root` is the project folder. Code under it is hashed into keys; code
 outside it is treated as a library. By default it is the folder holding
-the part's top-level package, or the script's folder.
+the part's top-level package, or the script's folder. A script run with
+`exec()` in a namespace that isn't a module (as app runners do) works too:
+its functions are hashed as project code.
+
+For apps that run cadcache inside their own pipeline:
+
+```python
+cadcache.configure(
+    salt={"app": "2.1", "tessellation": [10.0, 0.3]},  # mixed into every key
+    before_save=lambda shape: ...,   # called on a new build before it is stored
+    attributes=["bom"],              # plain-data attributes to keep
+)
+```
+
+`before_save` can tessellate a part so its BREP carries the mesh: a later
+hit then skips meshing in `export_gltf`. `attributes` keeps named Python
+attributes (JSON data only) on a part and its children, which BREP would
+otherwise drop.
+
+A build that has an effect a cache hit wouldn't repeat, such as
+registering itself in an app's registry, calls `cadcache.not_cacheable(
+"reason")`. That part returns what it built without storing it, and so
+does every part whose build is running around it. events() shows it as
+`uncacheable`, with the reason.
 
 `@assembly` marks a function that only places parts. It is never cached,
 and it shows up in `events()`.
@@ -177,7 +222,8 @@ shape as a Python attribute doesn't survive. A `Box` subclass comes back
 as a `Part`, and a `Solid` as a `Solid`.
 
 The cache grows: a changed part writes a new entry, and old entries stay.
-Delete the folder whenever you like.
+Delete the folder whenever you like. Entries written by an older cadcache
+are ignored (a miss), so upgrading never loads a stale shape.
 
 ```
 cadcache ls examples/.cadcache
@@ -200,8 +246,9 @@ edits are picked up. The runner watches the project's `.py`, `.yaml`,
 
 ## Using it from a GUI
 
-`cadcache.events()` lists each part as built, cached, uncached or an
-assembly, with timings. `cadcache.reset()` starts a new run.
+`cadcache.events()` lists each part as built, cached, uncached,
+uncacheable or an assembly, with timings, its part number and the path of
+its stored entry. `cadcache.reset()` starts a new run.
 `cadcache.summary()` gives a one-line report. `part.key(...)` and
 `part.paths(...)` return the key and files for a call without building
 anything. `cadcache.watch.run_once(script)` performs one in-process rerun.

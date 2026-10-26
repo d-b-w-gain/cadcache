@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .keys import location_values
 
-SIDECAR_VERSION = 1
+SIDECAR_VERSION = 2
 
 
 def entry_paths(cache_dir, fn_name, key):
@@ -48,7 +48,7 @@ def _atomic(path, write):
             os.remove(tmp)
 
 
-def save(shape, meta, brep_path, json_path):
+def save(shape, meta, brep_path, json_path, attributes=()):
     from build123d import export_brep
 
     def brep(tmp):
@@ -56,7 +56,8 @@ def save(shape, meta, brep_path, json_path):
             raise RuntimeError("BREP export failed for %s" % brep_path)
 
     _atomic(brep_path, brep)
-    meta = dict(meta, sidecar=SIDECAR_VERSION, shape=describe(shape))
+    meta = dict(meta, sidecar=SIDECAR_VERSION,
+                shape=describe(shape, attributes))
     text = json.dumps(meta, indent=1) + "\n"
     _atomic(json_path,
             lambda tmp: Path(tmp).write_text(text, encoding="utf-8"))
@@ -73,8 +74,10 @@ def _class_name(obj):
     return "%s.%s" % (type(obj).__module__, type(obj).__qualname__)
 
 
-def describe(shape):
-    """The parts of a shape BREP doesn't keep, as JSON."""
+def describe(shape, attributes=()):
+    """The parts of a shape BREP doesn't keep, as JSON. attributes: names
+    of plain-data Python attributes to keep as well, where they are set
+    and JSON can hold them."""
     color = getattr(shape, "color", None)
     node = {
         "type": _class_name(shape),
@@ -84,9 +87,20 @@ def describe(shape):
         "joints": [_joint(j) for j in
                    (getattr(shape, "joints", None) or {}).values()],
     }
+    attrs = {}
+    for name in attributes:
+        v = getattr(shape, name, None)
+        if v is None:
+            continue
+        try:
+            attrs[name] = json.loads(json.dumps(v, allow_nan=False))
+        except (TypeError, ValueError):
+            continue                    # not plain data; not kept
+    if attrs:
+        node["attrs"] = attrs
     kids = list(getattr(shape, "children", None) or ())
     if kids:
-        node["children"] = [describe(k) for k in kids]
+        node["children"] = [describe(k, attributes) for k in kids]
     return node
 
 
@@ -208,6 +222,8 @@ def rebuild(raw, node):
         shape.material = node["material"]
     for j in node.get("joints", ()):
         _restore_joint(shape, j)
+    for name, v in (node.get("attrs") or {}).items():
+        setattr(shape, name, v)
     return shape
 
 
@@ -227,8 +243,10 @@ def _restore_joint(shape, data):
     shape.joints[j.label] = j
 
 
-def mark(shape, key):
+def mark(shape, key, part_number=None):
     """Tag a shape a part returned, so passing it to another part keys on
-    `key` instead of re-hashing its BREP (until it is moved)."""
+    `key` instead of re-hashing its BREP, and its part number counts as an
+    input of that part (until it is moved)."""
     shape._cadcache_key = key
+    shape._cadcache_pn = part_number
     shape._cadcache_loc = location_values(shape.location)

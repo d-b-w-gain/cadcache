@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
 
-from . import keys, store
+from . import keys, partnums, store
 from .keys import FileReadWarning, GlobalReadWarning, CacheWarning
 
 log = logging.getLogger("cadcache")
@@ -35,22 +35,40 @@ class _Settings:
         "0", "off", "false", "no")
     cache_dir = os.environ.get("CADCACHE_DIR") or None
     root = None
+    salt = None
+    before_save = None
+    attributes = ()
 
 
 settings = _Settings()
 
 
-def configure(*, cache_dir=None, root=None, enabled=None):
+def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
+              before_save=None, attributes=None):
     """cache_dir: where entries go (default: CADCACHE_DIR, else .cadcache
     in the project folder of each part's module). root: the project
     folder - code under it is hashed into keys, code elsewhere (installed
-    libraries) isn't. enabled: the global switch (also CADCACHE=off)."""
+    libraries) isn't. enabled: the global switch (also CADCACHE=off).
+
+    salt: any keyable value, mixed into every key - for things outside
+    the code that change what a part's entry should hold (an app's
+    version, export settings). before_save: fn(shape), called on a newly
+    built shape just before it is stored, e.g. to tessellate it so the
+    BREP carries the mesh. attributes: names of plain-data attributes to
+    keep on a shape and its children (BREP drops Python attributes)."""
     if cache_dir is not None:
         settings.cache_dir = str(cache_dir)
     if root is not None:
         settings.root = Path(root).resolve()
     if enabled is not None:
         settings.enabled = bool(enabled)
+    if salt is not None:
+        keys.canon(salt, "salt")
+        settings.salt = salt
+    if before_save is not None:
+        settings.before_save = before_save
+    if attributes is not None:
+        settings.attributes = tuple(attributes)
 
 
 @contextmanager
@@ -68,8 +86,7 @@ def disabled():
 def _root(fn):
     if settings.root is not None:
         return settings.root
-    mod = sys.modules.get(fn.__module__)
-    return keys.module_root(mod) if mod else None
+    return keys.project_root(fn)
 
 
 def _cache_dir(fn):
@@ -81,11 +98,19 @@ def _cache_dir(fn):
 
 # ------------------------------------------------------------ run stats
 class Event:
-    __slots__ = ("name", "kind", "seconds", "key")
+    """One part call (or assembly). kind is "built", "cached",
+    "uncached" (switched off), "uncacheable" (see not_cacheable) or
+    "assembly". entry is the stored BREP's path for built and cached
+    parts; reason says why a part was uncacheable."""
+    __slots__ = ("name", "kind", "seconds", "key", "part_number", "entry",
+                 "reason")
 
-    def __init__(self, name, kind, seconds, key=None):
+    def __init__(self, name, kind, seconds, key=None, part_number=None,
+                 entry=None, reason=None):
         self.name, self.kind, self.seconds, self.key = \
             name, kind, seconds, key
+        self.part_number, self.entry, self.reason = \
+            part_number, entry, reason
 
     def __repr__(self):
         return "<%s %s %.3fs>" % (self.kind, self.name, self.seconds)
@@ -96,8 +121,7 @@ _warned = set()
 
 
 def events():
-    """What happened since reset(): Event(name, kind, seconds, key) with
-    kind "built", "cached", "uncached" (switched off) or "assembly"."""
+    """What happened since reset(), as Events."""
     return list(_events)
 
 
@@ -111,7 +135,7 @@ def reset():
 def summary():
     built = [e for e in _events if e.kind == "built"]
     cached = [e for e in _events if e.kind == "cached"]
-    off = [e for e in _events if e.kind == "uncached"]
+    off = [e for e in _events if e.kind in ("uncached", "uncacheable")]
     text = "%d parts: %d cached, %d built" % (
         len(built) + len(cached) + len(off), len(cached), len(built))
     if off:
@@ -145,11 +169,27 @@ _hook_installed = False
 _SKIP_SUFFIXES = {".py", ".pyc", ".pyd", ".so", ".dll", ".pth", ".brep"}
 
 
+class _Frame(set):
+    """One build in progress: the files it read, and why it can't be
+    cached, if something said so."""
+    reason = None
+
+
 def _frames():
     f = getattr(_local, "frames", None)
     if f is None:
         f = _local.frames = []
     return f
+
+
+def not_cacheable(reason):
+    """Called from inside a part's build: this build has an effect a
+    cache hit wouldn't repeat (registering itself somewhere, say). The
+    part returns what it built without storing it, and so does every part
+    whose build is running around it. Outside a build it does nothing."""
+    for frame in _frames():
+        if frame.reason is None:
+            frame.reason = str(reason)
 
 
 def _audit(event, args):
@@ -241,10 +281,11 @@ def _short(v, n=80):
 class Part:
     """A cached part function. Call it like the function."""
 
-    def __init__(self, fn, version=None):
+    def __init__(self, fn, version=None, part_class=None):
         functools.update_wrapper(self, fn)
         self.fn = fn
         self.version = version
+        self.part_class = part_class or fn.__name__.replace("_", "-")
         self.signature = inspect.signature(fn)
         self.__cadcache__ = "part"
 
@@ -278,19 +319,30 @@ class Part:
 
     def key(self, *args, **kwargs):
         """The cache key this call would use."""
-        return self._key(self._bind(args, kwargs))
+        return self._key(self._bind(args, kwargs))[0]
+
+    def part_number(self, *args, **kwargs):
+        """The part number this call gets: AAA-XXXX-XXXXX, hashed from
+        its inputs only, so a refactor doesn't change it (partnums.py)."""
+        return self._key(self._bind(args, kwargs))[1]
 
     def _key(self, arguments):
-        import build123d
+        """(cache key, part number) for bound arguments."""
         self._has_path_args = any(isinstance(v, PurePath)
                                   for v in arguments.values())
-        code, _ = keys.code_hash(self.fn, _root(self.fn), self._report)
+        global_values = {}
+        code, _ = keys.code_hash(self.fn, _root(self.fn), self._report,
+                                 global_values)
         args = {k: keys.canon(v, "argument %r of %s" % (k, _name(self.fn)))
                 for k, v in arguments.items()}
-        return keys.digest({
-            "cadcache": keys.FORMAT, "build123d": build123d.__version__,
+        key = keys.digest({
+            "cadcache": keys.FORMAT, "runtime": _runtime(),
             "fn": "%s.%s" % (self.fn.__module__, self.fn.__qualname__),
-            "code": code, "args": args, "version": self.version})
+            "code": code, "args": args, "version": self.version,
+            "salt": keys.canon(settings.salt, "salt")})
+        number = partnums.part_number(self.part_class, arguments,
+                                      global_values)
+        return key, number
 
     def paths(self, *args, **kwargs):
         """(brep, sidecar) paths for this call's cache entry."""
@@ -304,6 +356,7 @@ class Part:
     def _load(self, key, brep, side):
         meta = store.read_sidecar(side)
         if not (meta and meta.get("key") == key and brep.exists() and
+                meta.get("sidecar") == store.SIDECAR_VERSION and
                 _files_unchanged(meta.get("files", ()))):
             return None
         try:
@@ -324,7 +377,7 @@ class Part:
         arguments = self._bind(args, kwargs)
         t0 = time.perf_counter()
         with _paused():
-            key = self._key(arguments)
+            key, number = self._key(arguments)
             cache_dir = _cache_dir(self.fn)
             brep, side = store.entry_paths(cache_dir, name, key)
             hit = self._load(key, brep, side)
@@ -335,14 +388,14 @@ class Part:
             for frame in _frames():
                 frame.update(read)
             _run_files.update(read)
-            store.mark(shape, key)
+            store.mark(shape, key, number)
             dt = time.perf_counter() - t0
-            _events.append(Event(name, "cached", dt, key))
+            _events.append(Event(name, "cached", dt, key, number, str(brep)))
             log.debug("cached %s (%.3fs)", name, dt)
             return shape
 
         t0 = time.perf_counter()
-        frame = set()
+        frame = _Frame()
         _frames().append(frame)
         try:
             result = self.fn(*args, **kwargs)
@@ -355,6 +408,18 @@ class Part:
                 "part %s returned %s, not a build123d shape (in builder "
                 "mode, return builder.part / .sketch / .line)"
                 % (name, type(result).__name__))
+        if frame.reason is not None:
+            # An outer build includes this one's effect, so it can't be
+            # stored either (not_cacheable already marked it).
+            for outer in _frames():
+                outer.update(frame)
+            result._cadcache_pn = number
+            result._cadcache_loc = keys.location_values(result.location)
+            _events.append(Event(name, "uncacheable", built_s, key, number,
+                                 reason=frame.reason))
+            log.info("built %s (%.2fs), not cached: %s", name, built_s,
+                     frame.reason)
+            return result
 
         with _paused():
             files = _file_record(frame, cache_dir)
@@ -372,6 +437,7 @@ class Part:
         meta = {
             "key": key,
             "function": "%s.%s" % (self.fn.__module__, self.fn.__qualname__),
+            "part_number": number,
             "arguments": {k: _short(v) for k, v in arguments.items()},
             "built_s": round(built_s, 3),
             "created": datetime.now(timezone.utc).isoformat(
@@ -379,10 +445,12 @@ class Part:
             "files": files,
         }
         with _paused():
-            store.save(result, meta, brep, side)
+            if settings.before_save is not None:
+                settings.before_save(result)
+            store.save(result, meta, brep, side, settings.attributes)
             shape = store.load(brep, store.read_sidecar(side))
-        store.mark(shape, key)
-        _events.append(Event(name, "built", built_s, key))
+        store.mark(shape, key, number)
+        _events.append(Event(name, "built", built_s, key, number, str(brep)))
         log.info("built %s (%.2fs)", name, built_s)
         return shape
 
@@ -390,12 +458,32 @@ class Part:
         return "<cadcache part %s>" % _name(self.fn)
 
 
-def part(fn=None, *, version=None):
+def part(fn=None, *, version=None, part_class=None):
     """Cache what fn returns. Use as @part or @part(version=2); bumping
-    `version` forces a rebuild without changing the code."""
+    `version` forces a rebuild without changing the code. part_class is
+    the class its part numbers are hashed under (default: the function's
+    name, with hyphens)."""
     if fn is None:
-        return lambda f: Part(f, version)
-    return Part(fn, version)
+        return lambda f: Part(f, version, part_class)
+    return Part(fn, version, part_class)
+
+
+_RUNTIME = None
+
+
+def _runtime():
+    """Versions that change what a build or a stored BREP holds."""
+    global _RUNTIME
+    if _RUNTIME is None:
+        import build123d
+        try:
+            from importlib.metadata import version
+            ocp = version("cadquery-ocp")
+        except Exception:
+            ocp = ""
+        _RUNTIME = {"build123d": build123d.__version__, "ocp": ocp,
+                    "python": "%d.%d" % sys.version_info[:2]}
+    return _RUNTIME
 
 
 def assembly(fn):
