@@ -1,0 +1,414 @@
+"""
+@part and @assembly.
+
+A @part function is called as usual and returns a build123d shape. The
+first call with given inputs builds it and stores it; later calls with the
+same inputs load it from the cache instead. Either way the caller gets a
+fresh build123d object loaded from the stored BREP, so a part behaves the
+same whether it was just built or not.
+
+A part is rebuilt when its key changes (arguments, its code or a helper's,
+globals it reads, the build123d version - see keys.py) or when a file it
+read while building has changed since.
+"""
+import functools
+import inspect
+import logging
+import os
+import sys
+import threading
+import time
+import warnings
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path, PurePath
+
+from . import keys, store
+from .keys import FileReadWarning, GlobalReadWarning, CacheWarning
+
+log = logging.getLogger("cadcache")
+
+
+# ------------------------------------------------------------- settings
+class _Settings:
+    enabled = os.environ.get("CADCACHE", "").lower() not in (
+        "0", "off", "false", "no")
+    cache_dir = os.environ.get("CADCACHE_DIR") or None
+    root = None
+
+
+settings = _Settings()
+
+
+def configure(*, cache_dir=None, root=None, enabled=None):
+    """cache_dir: where entries go (default: CADCACHE_DIR, else .cadcache
+    in the project folder of each part's module). root: the project
+    folder - code under it is hashed into keys, code elsewhere (installed
+    libraries) isn't. enabled: the global switch (also CADCACHE=off)."""
+    if cache_dir is not None:
+        settings.cache_dir = str(cache_dir)
+    if root is not None:
+        settings.root = Path(root).resolve()
+    if enabled is not None:
+        settings.enabled = bool(enabled)
+
+
+@contextmanager
+def disabled():
+    """Build everything inside this block, without reading or writing the
+    cache."""
+    old = settings.enabled
+    settings.enabled = False
+    try:
+        yield
+    finally:
+        settings.enabled = old
+
+
+def _root(fn):
+    if settings.root is not None:
+        return settings.root
+    mod = sys.modules.get(fn.__module__)
+    return keys.module_root(mod) if mod else None
+
+
+def _cache_dir(fn):
+    if settings.cache_dir:
+        return Path(settings.cache_dir)
+    root = _root(fn)
+    return (root or Path.cwd()) / ".cadcache"
+
+
+# ------------------------------------------------------------ run stats
+class Event:
+    __slots__ = ("name", "kind", "seconds", "key")
+
+    def __init__(self, name, kind, seconds, key=None):
+        self.name, self.kind, self.seconds, self.key = \
+            name, kind, seconds, key
+
+    def __repr__(self):
+        return "<%s %s %.3fs>" % (self.kind, self.name, self.seconds)
+
+
+_events = []
+_warned = set()
+
+
+def events():
+    """What happened since reset(): Event(name, kind, seconds, key) with
+    kind "built", "cached", "uncached" (switched off) or "assembly"."""
+    return list(_events)
+
+
+def reset():
+    """Start a new run: clears events() and lets warnings show again."""
+    _events.clear()
+    _warned.clear()
+    _run_files.clear()
+
+
+def summary():
+    built = [e for e in _events if e.kind == "built"]
+    cached = [e for e in _events if e.kind == "cached"]
+    off = [e for e in _events if e.kind == "uncached"]
+    text = "%d parts: %d cached, %d built" % (
+        len(built) + len(cached) + len(off), len(cached), len(built))
+    if off:
+        text += ", %d uncached" % len(off)
+    if built:
+        text += " (%s)" % ", ".join("%s %.2fs" % (e.name, e.seconds)
+                                    for e in built)
+    return text
+
+
+def _warn(category, fn_name, what, message):
+    if (fn_name, what) in _warned:
+        return
+    _warned.add((fn_name, what))
+    warnings.warn(message, category, stacklevel=_caller_level())
+
+
+def _caller_level():
+    """stacklevel pointing at the first frame outside cadcache."""
+    here = os.path.dirname(__file__)
+    f, level = sys._getframe(1), 1
+    while f is not None and os.path.dirname(f.f_code.co_filename) == here:
+        f, level = f.f_back, level + 1
+    return level
+
+
+# ------------------------------------------------------- file recording
+_local = threading.local()
+_run_files = set()
+_hook_installed = False
+_SKIP_SUFFIXES = {".py", ".pyc", ".pyd", ".so", ".dll", ".pth", ".brep"}
+
+
+def _frames():
+    f = getattr(_local, "frames", None)
+    if f is None:
+        f = _local.frames = []
+    return f
+
+
+def _audit(event, args):
+    if event != "open":
+        return
+    frames = getattr(_local, "frames", None)
+    if not frames:
+        return
+    try:
+        path, mode, flags = args
+        if path is None or isinstance(path, int):
+            return
+        if mode is not None:
+            if any(c in mode for c in "wax+"):
+                return
+        elif flags & (os.O_WRONLY | os.O_RDWR):
+            return
+        p = os.fsdecode(os.fspath(path))
+        if os.path.splitext(p)[1].lower() in _SKIP_SUFFIXES:
+            return
+        p = os.path.abspath(p)
+        if keys.is_library_path(p):
+            return
+        for frame in frames:
+            frame.add(p)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _paused():
+    """Don't record files cadcache itself reads (sources, sidecars)."""
+    saved = _frames()
+    _local.frames = []
+    try:
+        yield
+    finally:
+        _local.frames = saved
+
+
+def _install_hook():
+    global _hook_installed
+    if not _hook_installed:
+        sys.addaudithook(_audit)
+        _hook_installed = True
+
+
+def _file_record(paths, cache_dir):
+    cache = os.path.normcase(os.path.abspath(cache_dir)) + os.sep
+    out = []
+    for p in sorted(paths):
+        if os.path.normcase(p).startswith(cache) or not os.path.isfile(p):
+            continue
+        st = os.stat(p)
+        out.append({"path": p, "sha256": keys.file_sha(p),
+                    "mtime_ns": st.st_mtime_ns, "size": st.st_size})
+    return out
+
+
+def _files_unchanged(files):
+    for f in files:
+        try:
+            st = os.stat(f["path"])
+        except OSError:
+            return False
+        if st.st_mtime_ns == f["mtime_ns"] and st.st_size == f["size"]:
+            continue
+        if st.st_size != f["size"] or keys.file_sha(f["path"]) != \
+                f["sha256"]:
+            return False
+    return True
+
+
+def run_files():
+    """Files parts read while building, this run (for file watchers)."""
+    return set(_run_files)
+
+
+# ------------------------------------------------------------ decorators
+def _name(fn):
+    return fn.__qualname__.replace("<locals>.", "")
+
+
+def _short(v, n=80):
+    r = repr(v)
+    return r if len(r) <= n else r[:n - 3] + "..."
+
+
+class Part:
+    """A cached part function. Call it like the function."""
+
+    def __init__(self, fn, version=None):
+        functools.update_wrapper(self, fn)
+        self.fn = fn
+        self.version = version
+        self.signature = inspect.signature(fn)
+        self.__cadcache__ = "part"
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return functools.partial(self, obj)
+
+    def _bind(self, args, kwargs):
+        bound = self.signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return bound.arguments
+
+    def _report(self, kind, what, where):
+        me = _name(self.fn)
+        if kind == "global":
+            _warn(GlobalReadWarning, me, what,
+                  "part %s reads global %s (in %s). Its value is in the "
+                  "cache key, but passing it as an argument keeps the part "
+                  "self-contained." % (me, what, where))
+        elif kind == "untracked":
+            _warn(GlobalReadWarning, me, what,
+                  "part %s reads global %s (in %s), which cadcache can't "
+                  "key: changes to it won't rebuild the part. Pass it as "
+                  "an argument." % (me, what, where))
+        elif kind == "occt" and not self._has_path_args:
+            _warn(FileReadWarning, me, what,
+                  "part %s calls %s (in %s). Files OCCT reads aren't seen "
+                  "by cadcache; pass the file as a pathlib.Path argument "
+                  "so its content is in the key." % (me, what, where))
+
+    def key(self, *args, **kwargs):
+        """The cache key this call would use."""
+        return self._key(self._bind(args, kwargs))
+
+    def _key(self, arguments):
+        import build123d
+        self._has_path_args = any(isinstance(v, PurePath)
+                                  for v in arguments.values())
+        code, _ = keys.code_hash(self.fn, _root(self.fn), self._report)
+        args = {k: keys.canon(v, "argument %r of %s" % (k, _name(self.fn)))
+                for k, v in arguments.items()}
+        return keys.digest({
+            "cadcache": keys.FORMAT, "build123d": build123d.__version__,
+            "fn": "%s.%s" % (self.fn.__module__, self.fn.__qualname__),
+            "code": code, "args": args, "version": self.version})
+
+    def paths(self, *args, **kwargs):
+        """(brep, sidecar) paths for this call's cache entry."""
+        key = self.key(*args, **kwargs)
+        return store.entry_paths(_cache_dir(self.fn), _name(self.fn), key)
+
+    def uncached(self, *args, **kwargs):
+        """Build without the cache: neither read nor written."""
+        return self.fn(*args, **kwargs)
+
+    def _load(self, key, brep, side):
+        meta = store.read_sidecar(side)
+        if not (meta and meta.get("key") == key and brep.exists() and
+                _files_unchanged(meta.get("files", ()))):
+            return None
+        try:
+            return store.load(brep, meta), meta
+        except Exception as e:          # damaged entry: build it again
+            log.warning("cache entry %s unreadable (%s), rebuilding",
+                        brep, e)
+            return None
+
+    def __call__(self, *args, **kwargs):
+        name = _name(self.fn)
+        if not settings.enabled:
+            t0 = time.perf_counter()
+            result = self.fn(*args, **kwargs)
+            _events.append(Event(name, "uncached", time.perf_counter() - t0))
+            return result
+        _install_hook()
+        arguments = self._bind(args, kwargs)
+        t0 = time.perf_counter()
+        with _paused():
+            key = self._key(arguments)
+            cache_dir = _cache_dir(self.fn)
+            brep, side = store.entry_paths(cache_dir, name, key)
+            hit = self._load(key, brep, side)
+        if hit is not None:
+            shape, meta = hit
+            # Whoever called this part depends on the files it read too.
+            read = [f["path"] for f in meta.get("files", ())]
+            for frame in _frames():
+                frame.update(read)
+            _run_files.update(read)
+            store.mark(shape, key)
+            dt = time.perf_counter() - t0
+            _events.append(Event(name, "cached", dt, key))
+            log.debug("cached %s (%.3fs)", name, dt)
+            return shape
+
+        t0 = time.perf_counter()
+        frame = set()
+        _frames().append(frame)
+        try:
+            result = self.fn(*args, **kwargs)
+        finally:
+            _frames().pop()
+        built_s = time.perf_counter() - t0
+        from build123d import Shape
+        if not isinstance(result, Shape):
+            raise TypeError(
+                "part %s returned %s, not a build123d shape (in builder "
+                "mode, return builder.part / .sketch / .line)"
+                % (name, type(result).__name__))
+
+        with _paused():
+            files = _file_record(frame, cache_dir)
+        _run_files.update(f["path"] for f in files)
+        arg_files = {os.path.normcase(os.path.abspath(v))
+                     for v in arguments.values()
+                     if isinstance(v, (str, PurePath)) and v}
+        for f in files:
+            if os.path.normcase(f["path"]) not in arg_files:
+                _warn(FileReadWarning, name, f["path"],
+                      "part %s read %s, which isn't an argument. It is "
+                      "tracked (a change rebuilds the part), but passing "
+                      "it as a pathlib.Path argument puts it in the key."
+                      % (name, f["path"]))
+        meta = {
+            "key": key,
+            "function": "%s.%s" % (self.fn.__module__, self.fn.__qualname__),
+            "arguments": {k: _short(v) for k, v in arguments.items()},
+            "built_s": round(built_s, 3),
+            "created": datetime.now(timezone.utc).isoformat(
+                timespec="seconds"),
+            "files": files,
+        }
+        with _paused():
+            store.save(result, meta, brep, side)
+            shape = store.load(brep, store.read_sidecar(side))
+        store.mark(shape, key)
+        _events.append(Event(name, "built", built_s, key))
+        log.info("built %s (%.2fs)", name, built_s)
+        return shape
+
+    def __repr__(self):
+        return "<cadcache part %s>" % _name(self.fn)
+
+
+def part(fn=None, *, version=None):
+    """Cache what fn returns. Use as @part or @part(version=2); bumping
+    `version` forces a rebuild without changing the code."""
+    if fn is None:
+        return lambda f: Part(f, version)
+    return Part(fn, version)
+
+
+def assembly(fn):
+    """Mark a function that only places parts. It is never cached - the
+    parts it calls are - and shows in events() as an assembly."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _events.append(Event(_name(fn), "assembly",
+                                 time.perf_counter() - t0))
+    wrapper.uncached = fn
+    wrapper.__cadcache__ = "assembly"
+    return wrapper

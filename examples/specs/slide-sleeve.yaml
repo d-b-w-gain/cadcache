@@ -1,0 +1,18 @@
+scheme: pn/1
+class: journal-sleeve
+name: Slide roller sleeve, M5 (draft)
+description: >-
+  3D-printed journal for the thin slide roller: a plain sleeve over the
+  thread of the M5 x 6 axle screw, as long as the roller and hub, so the
+  roller turns on plastic, not thread. Bore is a clearance fit on M5.
+uses:
+  roller: VWF-1Q5M-BNV91
+parameters:
+  running_fit_mm: 0.4      # diametral, roller bore over sleeve
+  bore_d_mm: 5.2
+  bed_chamfer_mm: 0.3
+appearance:
+  colour: [0.60, 0.60, 0.60]
+files:
+  - build_slide.py
+  - swkit.py

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cadcache"
+version = "0.1.0"
+description = "Per-part caching for build123d, keyed on input hashes"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["build123d>=0.9"]
+
+[project.optional-dependencies]
+partnum = ["partnum @ git+https://github.com/d-b-w-gain/partnum@v0.1.0"]
+
+[project.scripts]
+cadcache = "cadcache.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

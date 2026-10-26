@@ -1,0 +1,23 @@
+scheme: pn/1
+class: slide-roller
+name: Slide roller, thin, dincase drawer slide (draft)
+description: >-
+  3D-printed roller for the thin dincase drawer slide: two on the outside of
+  each shelf rail run on the fixed slide rail's leg, under a steel keeper
+  bar. A 4 mm rim and a 0.5 mm hub that bears on the shelf rail, so the
+  whole slide is 7 mm from the shelf rail's outer face to the fixed rail's.
+  Turns on a printed sleeve over an M5 x 6 axle screwed in from inside the
+  shelf rail; the fixed rail 0.5 mm away keeps it on. Bore is a standard
+  drill size: drill out after printing. Print flat, no supports.
+parameters:
+  roller_d_mm: 30          # rides on the fixed leg; sets the shelf ride
+  roller_h_mm: 4           # rim width
+  hub_h_mm: 0.5            # raised hub, bears on the shelf rail upright
+  hub_d_mm: 12
+  bore_d_mm: 8.0           # drill; runs on the sleeve
+  bed_chamfer_mm: 0.4
+appearance:
+  colour: [0.95, 0.55, 0.10]
+files:
+  - build_slide.py
+  - swkit.py
