@@ -15,6 +15,7 @@ import builtins
 import functools
 import inspect
 import io
+import json
 import logging
 import os
 import sys
@@ -40,13 +41,17 @@ class _Settings:
     salt = None
     before_save = None
     attributes = ()
+    on_hit = None
+    validate = None
+    rebind = None
 
 
 settings = _Settings()
 
 
 def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
-              before_save=None, attributes=None):
+              before_save=None, attributes=None, on_hit=None,
+              validate=None, rebind=None):
     """cache_dir: where entries go (default: CADCACHE_DIR, else .cadcache
     in the project folder of each part's module). root: the project
     folder - code under it is hashed into keys, code elsewhere (installed
@@ -57,7 +62,16 @@ def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
     version, export settings). before_save: fn(shape), called on a newly
     built shape just before it is stored, e.g. to tessellate it so the
     BREP carries the mesh. attributes: names of plain-data attributes to
-    keep on a shape and its children (BREP drops Python attributes)."""
+    keep on a shape and its children (BREP drops Python attributes).
+
+    on_hit: fn(shape, effects), called when a part loads from the cache
+    with the effects its build recorded (see record_effect), so the app
+    can redo them on the loaded shape. validate: fn(shape, effects),
+    called on a new build before it is stored; returning a reason string
+    returns the part as built but doesn't store it. rebind: fn(built,
+    loaded, effects), called after a new build is stored: the caller gets
+    `loaded` (read back from the entry), not `built`, so anything the
+    effects attached to `built` can be moved across."""
     if cache_dir is not None:
         settings.cache_dir = str(cache_dir)
     if root is not None:
@@ -71,6 +85,12 @@ def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
         settings.before_save = before_save
     if attributes is not None:
         settings.attributes = tuple(attributes)
+    if on_hit is not None:
+        settings.on_hit = on_hit
+    if validate is not None:
+        settings.validate = validate
+    if rebind is not None:
+        settings.rebind = rebind
 
 
 @contextmanager
@@ -171,9 +191,13 @@ _SKIP_SUFFIXES = {".py", ".pyc", ".pyd", ".so", ".dll", ".pth", ".brep"}
 
 
 class _Frame(set):
-    """One build in progress: the files it read, and why it can't be
-    cached, if something said so."""
+    """One build in progress: the files it read, the effects it recorded,
+    and why it can't be cached, if something said so."""
     reason = None
+
+    def __init__(self):
+        super().__init__()
+        self.effects = []
 
 
 def _frames():
@@ -191,6 +215,23 @@ def not_cacheable(reason):
     for frame in _frames():
         if frame.reason is None:
             frame.reason = str(reason)
+
+
+def record_effect(data):
+    """Called from inside a part's build: this build did something outside
+    its shape (registered a component, say) that a cache hit must redo.
+    data is plain JSON data; it is stored with the entry of this part and
+    of every part whose build is running around it, and handed back to
+    configure(on_hit=...) when one of them loads from the cache. A part
+    that loads from the cache inside another build gets its effects back
+    through on_hit, so the app records them again for the outer build.
+    Outside a build it does nothing."""
+    frames = _frames()
+    if not frames:
+        return
+    data = json.loads(json.dumps(data, allow_nan=False))
+    for frame in frames:
+        frame.effects.append(data)
 
 
 def _record(path, mode, flags):
@@ -444,6 +485,9 @@ class Part:
                 frame.update(read)
             _run_files.update(read)
             store.mark(shape, key, number)
+            effects = meta.get("effects") or []
+            if effects and settings.on_hit is not None:
+                settings.on_hit(shape, effects)
             dt = time.perf_counter() - t0
             _events.append(Event(name, "cached", dt, key, number, str(brep)))
             log.debug("cached %s (%.3fs)", name, dt)
@@ -464,17 +508,23 @@ class Part:
                 "part %s returned %s, not a build123d shape (in builder "
                 "mode, return builder.part / .sketch / .line)"
                 % (name, type(result).__name__))
-        if frame.reason is not None:
+        reason = frame.reason
+        if reason is not None:
             # An outer build includes this one's effect, so it can't be
             # stored either (not_cacheable already marked it).
             for outer in _frames():
                 outer.update(frame)
+        elif settings.validate is not None:
+            # Only this entry is refused: an outer build may still be
+            # storable (it may have made what this one only borrowed).
+            reason = settings.validate(result, list(frame.effects))
+        if reason is not None:
             result._cadcache_pn = number
             result._cadcache_loc = keys.location_values(result.location)
             _events.append(Event(name, "uncacheable", built_s, key, number,
-                                 reason=frame.reason))
+                                 reason=str(reason)))
             log.info("built %s (%.2fs), not cached: %s", name, built_s,
-                     frame.reason)
+                     reason)
             return result
 
         with _paused():
@@ -499,6 +549,7 @@ class Part:
             "created": datetime.now(timezone.utc).isoformat(
                 timespec="seconds"),
             "files": files,
+            "effects": frame.effects,
         }
         with _paused():
             if settings.before_save is not None:
@@ -506,6 +557,8 @@ class Part:
             store.save(result, meta, brep, side, settings.attributes)
             shape = store.load(brep, store.read_sidecar(side))
         store.mark(shape, key, number)
+        if frame.effects and settings.rebind is not None:
+            settings.rebind(result, shape, list(frame.effects))
         _events.append(Event(name, "built", built_s, key, number, str(brep)))
         log.info("built %s (%.2fs)", name, built_s)
         return shape

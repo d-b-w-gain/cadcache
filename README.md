@@ -197,10 +197,28 @@ attributes (JSON data only) on a part and its children, which BREP would
 otherwise drop.
 
 A build that has an effect a cache hit wouldn't repeat, such as
-registering itself in an app's registry, calls `cadcache.not_cacheable(
-"reason")`. That part returns what it built without storing it, and so
-does every part whose build is running around it. events() shows it as
-`uncacheable`, with the reason.
+registering itself in an app's registry, has two options:
+
+- Record the effect so a hit can redo it. During the build the app calls
+  `cadcache.record_effect(data)` with plain JSON data; it is stored with
+  that part's entry and with the entries of every part being built around
+  it. On a hit, `on_hit(shape, effects)` gets the loaded shape and the
+  recorded effects, in order, and redoes them (recording them again, so an
+  outer build being stored keeps them too). Because a new build returns
+  the copy read back from its entry, `rebind(built, loaded, effects)` lets
+  the app move what the effects attached to the built shape over to the
+  loaded one. `validate(shape, effects)` can return a reason to refuse to
+  store a build whose effects can't be redone.
+- Or call `cadcache.not_cacheable("reason")`. That part returns what it
+  built without storing it, and so does every part whose build is running
+  around it.
+
+```python
+cadcache.configure(on_hit=redo, rebind=move_to_loaded, validate=check)
+```
+
+events() shows a refused or `not_cacheable` part as `uncacheable`, with
+the reason.
 
 `@assembly` marks a function that only places parts. It is never cached,
 and it shows up in `events()`.

@@ -77,6 +77,9 @@ class Project(unittest.TestCase):
         cadcache.core.settings.salt = None
         cadcache.core.settings.before_save = None
         cadcache.core.settings.attributes = ()
+        cadcache.core.settings.on_hit = None
+        cadcache.core.settings.validate = None
+        cadcache.core.settings.rebind = None
         warnings.resetwarnings()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -268,6 +271,33 @@ class Switches(Project):
 
 
 class Metadata(Project):
+    def test_reparented_child_is_stored_as_the_tree_has_it(self):
+        src = '''
+            from build123d import Box, Compound, Location
+            from cadcache import part
+
+            @part
+            def regrouped():
+                a = Box(1, 1, 1)
+                b = Box(2, 2, 2).moved(Location((5, 0, 0)))
+                c = Box(3, 3, 3).moved(Location((10, 0, 0)))
+                a.label, b.label, c.label = "a", "b", "c"
+                first = Compound(children=[a, b, c], label="first")
+                outer = Compound(children=[first], label="outer")
+                # b moves to another parent. first's OCCT compound follows,
+                # but outer's still holds first's old one, with b in it.
+                Compound(children=[b], label="elsewhere")
+                return outer
+            '''
+        m = self.module(src)
+        built = m.regrouped()
+        cached = m.regrouped()
+        self.assertEqual(self.kinds(), {"regrouped": "cached"})
+        for shape in (built, cached):
+            (first,) = shape.children
+            self.assertEqual([k.label for k in first.children], ["a", "c"])
+            self.assertAlmostEqual(sum(k.volume for k in first.children), 28, places=6)
+
     def test_label_colour_joints_children(self):
         src = '''
             from build123d import (Axis, Box, Color, Compound, Cylinder,
@@ -695,7 +725,108 @@ class NotCacheable(Project):
         cadcache.not_cacheable("nothing is building")
 
 
-PN = r"^[A-HJKMNP-TV-Z]{3}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{5}$"
+class Effects(Project):
+    SRC = '''
+        from build123d import Box, Compound, Location
+        import cadcache
+        from cadcache import part
+
+        @part
+        def inner(w):
+            cadcache.record_effect({"made": "inner", "w": w})
+            return Box(w, w, w)
+
+        @part
+        def outer(w):
+            cadcache.record_effect({"made": "outer"})
+            return Compound(children=[inner(w),
+                                      inner(w + 1).moved(Location((9, 0, 0)))])
+        '''
+
+    def hooks(self, rerecord=False):
+        """Configure on_hit/rebind recorders; returns (replayed, rebound)."""
+        replayed, rebound = [], []
+
+        def on_hit(shape, effects):
+            replayed.append(effects)
+            if rerecord:              # what an app does: redo, so re-record
+                for effect in effects:
+                    cadcache.record_effect(effect)
+
+        cadcache.configure(on_hit=on_hit,
+                           rebind=lambda built, loaded, effects:
+                           rebound.append((built, loaded, effects)))
+        return replayed, rebound
+
+    def test_effects_are_stored_and_replayed_on_a_hit(self):
+        replayed, rebound = self.hooks()
+        m = self.module(self.SRC)
+        a = m.inner(2)
+        self.assertEqual(replayed, [])
+        built, loaded, effects = rebound[0]
+        self.assertIs(loaded, a)                 # caller got the loaded copy
+        self.assertIsNot(built, a)
+        self.assertEqual(effects, [{"made": "inner", "w": 2}])
+        m.inner(2)
+        self.assertEqual(replayed, [[{"made": "inner", "w": 2}]])
+        self.assertEqual([e.kind for e in cadcache.events()],
+                         ["built", "cached"])
+
+    def test_outer_entry_holds_inner_effects(self):
+        replayed, _ = self.hooks(rerecord=True)
+        m = self.module(self.SRC)
+        m.outer(2)
+        self.kinds()
+        m.outer(2)                               # one hit: inner never runs
+        self.assertEqual(self.kinds(), {"outer": "cached"})
+        self.assertEqual(replayed[-1], [{"made": "outer"},
+                                        {"made": "inner", "w": 2},
+                                        {"made": "inner", "w": 3}])
+
+    def test_inner_hit_inside_outer_build_is_recorded_for_outer(self):
+        replayed, _ = self.hooks(rerecord=True)
+        m = self.module(self.SRC)
+        m.inner(2)                               # inner(2) is now stored
+        m.outer(2)                               # builds; inner(2) is a hit
+        self.assertEqual(replayed, [[{"made": "inner", "w": 2}]])
+        self.kinds()
+        m.outer(2)
+        self.assertEqual(replayed[-1], [{"made": "outer"},
+                                        {"made": "inner", "w": 2},
+                                        {"made": "inner", "w": 3}])
+
+    def test_validate_can_refuse_to_store(self):
+        cadcache.configure(validate=lambda shape, effects:
+                           "borrowed" if effects else None)
+        m = self.module(self.SRC)
+        m.inner(2)
+        m.inner(2)
+        events = cadcache.events()
+        self.assertEqual([e.kind for e in events],
+                         ["uncacheable", "uncacheable"])
+        self.assertEqual(events[0].reason, "borrowed")
+        self.assertFalse(m.inner.paths(2)[1].exists())
+
+    def test_effects_must_be_plain_data(self):
+        src = '''
+            from build123d import Box
+            import cadcache
+            from cadcache import part
+
+            @part
+            def bad():
+                cadcache.record_effect({"shape": Box(1, 1, 1)})
+                return Box(1, 1, 1)
+            '''
+        m = self.module(src)
+        with self.assertRaises(TypeError):
+            m.bad()
+
+    def test_outside_a_build_it_does_nothing(self):
+        cadcache.record_effect({"nothing": "is building"})
+
+
+PN =r"^[A-HJKMNP-TV-Z]{3}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{5}$"
 
 
 class PartNumbers(Project):

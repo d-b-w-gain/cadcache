@@ -49,10 +49,11 @@ def _atomic(path, write):
 
 
 def save(shape, meta, brep_path, json_path, attributes=()):
-    from build123d import export_brep
+    from OCP.BRepTools import BRepTools
 
     def brep(tmp):
-        if not export_brep(shape, tmp):
+        # What build123d's export_brep does, but for the tree as it stands.
+        if BRepTools.Write_s(_tree_topods(shape), tmp) is False:
             raise RuntimeError("BREP export failed for %s" % brep_path)
 
     _atomic(brep_path, brep)
@@ -98,10 +99,36 @@ def describe(shape, attributes=()):
             continue                    # not plain data; not kept
     if attrs:
         node["attrs"] = attrs
-    kids = list(getattr(shape, "children", None) or ())
+    kids = _stored_children(shape)
     if kids:
         node["children"] = [describe(k, attributes) for k in kids]
     return node
+
+
+def _stored_children(shape):
+    return [k for k in (getattr(shape, "children", None) or ())
+            if k.wrapped is not None]
+
+
+def _tree_topods(shape):
+    """The shape's OCCT shape as its build123d tree stands now: a compound
+    of its children's, recursively, at its own location. A parent's own
+    `wrapped` is a snapshot from when it was built, and lags the tree once
+    a child has been re-parented elsewhere, so it can't be stored as is:
+    the sidecar describes the tree, and the two must match on load."""
+    kids = _stored_children(shape)
+    if not kids:
+        return shape.wrapped
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Compound
+    compound = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(compound)
+    for kid in kids:
+        builder.Add(compound, _tree_topods(kid))
+    if shape.wrapped is not None:
+        compound = compound.Located(shape.wrapped.Location())
+    return compound
 
 
 def _joint(j):
