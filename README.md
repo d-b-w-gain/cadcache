@@ -204,7 +204,9 @@ registering itself in an app's registry, has two options:
   that part's entry and with the entries of every part being built around
   it. On a hit, `on_hit(shape, effects)` gets the loaded shape and the
   recorded effects, in order, and redoes them (recording them again, so an
-  outer build being stored keeps them too). Because a new build returns
+  outer build being stored keeps them too). If it can't (something an
+  effect refers to is missing), it returns False without changing
+  anything, and the part is built instead. Because a new build returns
   the copy read back from its entry, `rebind(built, loaded, effects)` lets
   the app move what the effects attached to the built shape over to the
   loaded one. `validate(shape, effects)` can return a reason to refuse to

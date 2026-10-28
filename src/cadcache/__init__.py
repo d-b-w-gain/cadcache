@@ -11,4 +11,4 @@ __all__ = ["CacheWarning", "Event", "FileReadWarning", "GlobalReadWarning",
            "not_cacheable", "part", "part_number_of", "register_key",
            "record_effect", "requirements_key", "reset", "run_files",
            "summary"]
-__version__ = "0.3.0"
+__version__ = "0.4.0"

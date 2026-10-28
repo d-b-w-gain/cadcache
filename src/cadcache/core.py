@@ -66,7 +66,8 @@ def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
 
     on_hit: fn(shape, effects), called when a part loads from the cache
     with the effects its build recorded (see record_effect), so the app
-    can redo them on the loaded shape. validate: fn(shape, effects),
+    can redo them on the loaded shape; returning False (having changed
+    nothing) builds the part instead. validate: fn(shape, effects),
     called on a new build before it is stored; returning a reason string
     returns the part as built but doesn't store it. rebind: fn(built,
     loaded, effects), called after a new build is stored: the caller gets
@@ -486,8 +487,14 @@ class Part:
             _run_files.update(read)
             store.mark(shape, key, number)
             effects = meta.get("effects") or []
-            if effects and settings.on_hit is not None:
-                settings.on_hit(shape, effects)
+            if effects and settings.on_hit is not None and \
+                    settings.on_hit(shape, effects) is False:
+                # The app can't redo these effects now (something they
+                # refer to is missing): build the part instead.
+                log.info("cache entry for %s can't be replayed, rebuilding",
+                         name)
+                hit = None
+        if hit is not None:
             dt = time.perf_counter() - t0
             _events.append(Event(name, "cached", dt, key, number, str(brep)))
             log.debug("cached %s (%.3fs)", name, dt)

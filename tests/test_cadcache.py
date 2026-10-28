@@ -795,6 +795,22 @@ class Effects(Project):
                                         {"made": "inner", "w": 2},
                                         {"made": "inner", "w": 3}])
 
+    def test_on_hit_returning_false_builds_instead(self):
+        replays = []
+
+        def on_hit(shape, effects):
+            replays.append(effects)
+            return False              # what it refers to is gone
+
+        cadcache.configure(on_hit=on_hit)
+        m = self.module(self.SRC)
+        m.inner(2)
+        rebuilt = m.inner(2)
+        self.assertEqual(len(replays), 1)
+        self.assertEqual([e.kind for e in cadcache.events()],
+                         ["built", "built"])
+        self.assertAlmostEqual(rebuilt.volume, 8, places=6)
+
     def test_validate_can_refuse_to_store(self):
         cadcache.configure(validate=lambda shape, effects:
                            "borrowed" if effects else None)
