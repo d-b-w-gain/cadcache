@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cadcache"
-version = "0.4.0"
+version = "0.5.0"
 description = "Per-part caching for build123d, keyed on input hashes"
 readme = "README.md"
 requires-python = ">=3.10"

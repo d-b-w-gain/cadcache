@@ -48,20 +48,43 @@ def _atomic(path, write):
             os.remove(tmp)
 
 
-def save(shape, meta, brep_path, json_path, attributes=()):
+def snapshot(shape, meta, attributes=()):
+    """Everything an entry stores about a shape, taken now: its OCCT shape
+    as the build123d tree stands (OCCT shapes don't change once made) and
+    its sidecar. Cheap next to writing; later changes to the shape don't
+    reach it."""
+    return (_tree_topods(shape),
+            dict(meta, sidecar=SIDECAR_VERSION,
+                 shape=describe(shape, attributes)))
+
+
+def write(snap, brep_path, json_path):
+    """Write a snapshot as an entry: BREP first, sidecar (the completion
+    marker) last."""
     from OCP.BRepTools import BRepTools
+    topods, meta = snap
 
     def brep(tmp):
-        # What build123d's export_brep does, but for the tree as it stands.
-        if BRepTools.Write_s(_tree_topods(shape), tmp) is False:
+        # What build123d's export_brep does, for the snapshot's shape.
+        if BRepTools.Write_s(topods, tmp) is False:
             raise RuntimeError("BREP export failed for %s" % brep_path)
 
     _atomic(brep_path, brep)
-    meta = dict(meta, sidecar=SIDECAR_VERSION,
-                shape=describe(shape, attributes))
     text = json.dumps(meta, indent=1) + "\n"
     _atomic(json_path,
             lambda tmp: Path(tmp).write_text(text, encoding="utf-8"))
+
+
+def save(shape, meta, brep_path, json_path, attributes=()):
+    write(snapshot(shape, meta, attributes), brep_path, json_path)
+
+
+def from_snapshot(snap):
+    """A fresh shape rebuilt from a snapshot, as load() rebuilds one from an
+    entry on disk."""
+    from build123d import Compound
+    topods, meta = snap
+    return rebuild(Compound.cast(topods), meta["shape"])
 
 
 def load(brep_path, meta):

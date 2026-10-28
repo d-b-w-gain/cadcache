@@ -44,14 +44,19 @@ class _Settings:
     on_hit = None
     validate = None
     rebind = None
+    defer_saves = False
 
 
 settings = _Settings()
 
+# Deferred saves (configure(defer_saves=True)): entry paths -> (snapshot,
+# built shape, sidecar path), written by flush().
+_pending = {}
+
 
 def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
               before_save=None, attributes=None, on_hit=None,
-              validate=None, rebind=None):
+              validate=None, rebind=None, defer_saves=None):
     """cache_dir: where entries go (default: CADCACHE_DIR, else .cadcache
     in the project folder of each part's module). root: the project
     folder - code under it is hashed into keys, code elsewhere (installed
@@ -72,7 +77,12 @@ def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
     returns the part as built but doesn't store it. rebind: fn(built,
     loaded, effects), called after a new build is stored: the caller gets
     `loaded` (read back from the entry), not `built`, so anything the
-    effects attached to `built` can be moved across."""
+    effects attached to `built` can be moved across.
+
+    defer_saves: a new build returns the shape it built, and its entry is
+    snapshotted (cheap) and written by flush() later - after a result has
+    been delivered, say. A repeat call before then is served from the
+    snapshot. rebind isn't called: the caller has the built shape."""
     if cache_dir is not None:
         settings.cache_dir = str(cache_dir)
     if root is not None:
@@ -92,6 +102,32 @@ def configure(*, cache_dir=None, root=None, enabled=None, salt=None,
         settings.validate = validate
     if rebind is not None:
         settings.rebind = rebind
+    if defer_saves is not None:
+        settings.defer_saves = bool(defer_saves)
+
+
+def flush():
+    """Write the entries of deferred saves. A failed write is logged and
+    skipped (the part just builds again next time). Returns how many were
+    written."""
+    written = 0
+    pending = list(_pending.items())
+    _pending.clear()
+    with _paused():
+        for (brep, side), (snap, built) in pending:
+            try:
+                if settings.before_save is not None:
+                    settings.before_save(built)
+                store.write(snap, brep, side)
+                written += 1
+            except Exception as e:
+                log.warning("couldn't write cache entry %s (%s)", brep, e)
+    return written
+
+
+def pending_saves():
+    """How many deferred saves are waiting for flush()."""
+    return len(_pending)
 
 
 @contextmanager
@@ -452,6 +488,10 @@ class Part:
         return self.fn(*args, **kwargs)
 
     def _load(self, key, brep, side):
+        pending = _pending.get((brep, side))
+        if pending is not None:          # built earlier this run, not written
+            snap = pending[0]
+            return store.from_snapshot(snap), snap[1]
         meta = store.read_sidecar(side)
         if not (meta and meta.get("key") == key and brep.exists() and
                 meta.get("sidecar") == store.SIDECAR_VERSION and
@@ -558,6 +598,17 @@ class Part:
             "files": files,
             "effects": frame.effects,
         }
+        if settings.defer_saves:
+            # The caller gets what was built; the entry is fixed as it is
+            # now and written by flush().
+            with _paused():
+                _pending[(brep, side)] = (
+                    store.snapshot(result, meta, settings.attributes), result)
+            store.mark(result, key, number)
+            _events.append(Event(name, "built", built_s, key, number,
+                                 str(brep)))
+            log.info("built %s (%.2fs), entry deferred", name, built_s)
+            return result
         with _paused():
             if settings.before_save is not None:
                 settings.before_save(result)

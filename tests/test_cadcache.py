@@ -80,6 +80,8 @@ class Project(unittest.TestCase):
         cadcache.core.settings.on_hit = None
         cadcache.core.settings.validate = None
         cadcache.core.settings.rebind = None
+        cadcache.core.settings.defer_saves = False
+        cadcache.core._pending.clear()
         warnings.resetwarnings()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -723,6 +725,64 @@ class NotCacheable(Project):
 
     def test_outside_a_build_it_does_nothing(self):
         cadcache.not_cacheable("nothing is building")
+
+
+class DeferredSaves(Project):
+    SRC = '''
+        from build123d import Box, Color
+        import cadcache
+        from cadcache import part
+
+        @part
+        def block(w):
+            b = Box(w, 1, 1)
+            b.label = "block"
+            cadcache.record_effect({"w": w})
+            return b
+        '''
+
+    def test_build_returns_what_was_built_and_flush_writes_the_entry(self):
+        cadcache.configure(defer_saves=True)
+        m = self.module(self.SRC)
+        built = m.block(2)
+        self.assertEqual(built.label, "block")
+        brep, side = m.block.paths(2)
+        self.assertFalse(side.exists())            # nothing written yet
+        self.assertEqual(cadcache.pending_saves(), 1)
+        self.assertEqual(cadcache.flush(), 1)
+        self.assertTrue(side.exists() and brep.exists())
+        self.assertEqual(cadcache.pending_saves(), 0)
+        cadcache.reset()
+        loaded = m.block(2)
+        self.assertEqual(self.kinds(), {"block": "cached"})
+        self.assertAlmostEqual(loaded.volume, 2, places=6)
+
+    def test_entry_is_the_shape_as_returned_not_as_changed_after(self):
+        cadcache.configure(defer_saves=True)
+        m = self.module(self.SRC)
+        built = m.block(2)
+        built.label = "relabelled by the caller"    # after the part returned
+        built.color = Color("red")
+        cadcache.flush()
+        cadcache.configure(defer_saves=False)
+        cadcache.reset()
+        loaded = m.block(2)
+        self.assertEqual(self.kinds(), {"block": "cached"})
+        self.assertEqual(loaded.label, "block")
+        self.assertIsNone(loaded.color)
+
+    def test_repeat_call_before_flush_is_served_from_the_snapshot(self):
+        replayed = []
+        cadcache.configure(defer_saves=True,
+                           on_hit=lambda shape, effects: replayed.append(effects))
+        m = self.module(self.SRC)
+        first = m.block(3)
+        second = m.block(3)
+        self.assertEqual([e.kind for e in cadcache.events()],
+                         ["built", "cached"])
+        self.assertIsNot(first, second)              # a fresh copy
+        self.assertAlmostEqual(second.volume, 3, places=6)
+        self.assertEqual(replayed, [[{"w": 3}]])     # effects replayed too
 
 
 class Effects(Project):

@@ -222,6 +222,12 @@ cadcache.configure(on_hit=redo, rebind=move_to_loaded, validate=check)
 events() shows a refused or `not_cacheable` part as `uncacheable`, with
 the reason.
 
+With `cadcache.configure(defer_saves=True)`, a new build returns the shape
+it built and its entry is written later, by `cadcache.flush()`: an app can
+deliver its result first and store entries after. The entry is fixed when
+the part returns (later changes to the shape don't reach it), and a repeat
+call before the flush is served from it.
+
 `@assembly` marks a function that only places parts. It is never cached,
 and it shows up in `events()`.
 
