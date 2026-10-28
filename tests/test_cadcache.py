@@ -464,6 +464,63 @@ class Inputs(Project):
         m.outer()
         self.assertEqual(self.kinds(), {"outer": "built", "inner": "built"})
 
+    def test_low_level_os_open_read_is_tracked(self):
+        data = self.root / "size.txt"
+        data.write_text("10")
+        src = '''
+            import os
+            from pathlib import Path
+            from build123d import Box
+            from cadcache import part
+
+            @part
+            def box():
+                fd = os.open(Path(__file__).with_name("size.txt"), os.O_RDONLY)
+                try:
+                    w = float(os.read(fd, 16))
+                finally:
+                    os.close(fd)
+                return Box(w, 1, 1)
+            '''
+        m = self.module(src)
+        m.box()
+        self.assertIn(str(data), cadcache.run_files())
+        m.box()
+        self.assertEqual(self.kinds(), {"box": "cached"})
+        data.write_text("20")
+        self.assertAlmostEqual(m.box().volume, 20, places=6)
+        self.assertEqual(self.kinds(), {"box": "built"})
+
+    def test_open_is_only_wrapped_while_a_part_builds(self):
+        import builtins
+        import io
+        import os
+        real = (builtins.open, io.open, os.open)
+        src = '''
+            import builtins
+            from build123d import Box
+            from cadcache import part
+
+            @part
+            def box():
+                builtins._cadcache_test_open = builtins.open
+                return Box(1, 1, 1)
+
+            @part
+            def broken():
+                raise ValueError("boom")
+            '''
+        m = self.module(src)
+        try:
+            m.box()
+            self.assertIsNot(builtins._cadcache_test_open, real[0])
+            self.assertEqual((builtins.open, io.open, os.open), real)
+            with self.assertRaises(ValueError):
+                m.broken()
+            self.assertEqual((builtins.open, io.open, os.open), real)
+        finally:
+            builtins.__dict__.pop("_cadcache_test_open", None)
+
     def test_path_argument_keyed_on_content(self):
         data = self.root / "size.txt"
         data.write_text("10")

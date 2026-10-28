@@ -9,4 +9,4 @@ __all__ = ["CacheWarning", "Event", "FileReadWarning", "GlobalReadWarning",
            "Part", "assembly", "configure", "disabled", "events",
            "not_cacheable", "part", "part_number_of", "register_key",
            "requirements_key", "reset", "run_files", "summary"]
-__version__ = "0.2.0"
+__version__ = "0.2.1"

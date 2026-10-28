@@ -11,8 +11,10 @@ A part is rebuilt when its key changes (arguments, its code or a helper's,
 globals it reads, the build123d version - see keys.py) or when a file it
 read while building has changed since.
 """
+import builtins
 import functools
 import inspect
+import io
 import logging
 import os
 import sys
@@ -165,7 +167,6 @@ def _caller_level():
 # ------------------------------------------------------- file recording
 _local = threading.local()
 _run_files = set()
-_hook_installed = False
 _SKIP_SUFFIXES = {".py", ".pyc", ".pyd", ".so", ".dll", ".pth", ".brep"}
 
 
@@ -192,14 +193,13 @@ def not_cacheable(reason):
             frame.reason = str(reason)
 
 
-def _audit(event, args):
-    if event != "open":
-        return
+def _record(path, mode, flags):
+    """Note a file opened for reading in every build running on this
+    thread."""
     frames = getattr(_local, "frames", None)
     if not frames:
         return
     try:
-        path, mode, flags = args
         if path is None or isinstance(path, int):
             return
         if mode is not None:
@@ -230,11 +230,67 @@ def _paused():
         _local.frames = saved
 
 
-def _install_hook():
-    global _hook_installed
-    if not _hook_installed:
-        sys.addaudithook(_audit)
-        _hook_installed = True
+# Files are seen by wrapping open() only while a build runs, not by a
+# sys.addaudithook: an audit hook can never be removed, and every audit
+# event in the process (millions of attribute reads under a profiler or
+# tracer) would then call into Python. Opens through a reference taken
+# before the build started, or through _io.FileIO directly, aren't seen.
+_watch_lock = threading.Lock()
+_watch_depth = 0
+_saved_opens = None
+
+
+def _recording_open(real):
+    @functools.wraps(real)
+    def open(file, *args, **kwargs):
+        if getattr(_local, "frames", None):
+            mode = args[0] if args else kwargs.get("mode", "r")
+            _record(file, mode, None)
+        return real(file, *args, **kwargs)
+    return open
+
+
+def _recording_os_open(real):
+    @functools.wraps(real)
+    def open(path, *args, **kwargs):
+        if getattr(_local, "frames", None):
+            flags = args[0] if args else kwargs.get("flags", 0)
+            _record(path, None, flags)
+        return real(path, *args, **kwargs)
+    return open
+
+
+@contextmanager
+def _watching():
+    """Record files opened while a build runs. Nested and concurrent
+    builds share one set of wrappers; the last one out restores open()."""
+    global _watch_depth, _saved_opens
+    with _watch_lock:
+        if _watch_depth == 0:
+            real = (builtins.open, io.open, os.open)
+            ours_b = _recording_open(real[0])
+            # io.open is normally builtins.open itself: wrap it once.
+            ours_io = ours_b if real[1] is real[0] else _recording_open(real[1])
+            ours = (ours_b, ours_io, _recording_os_open(real[2]))
+            builtins.open, io.open, os.open = ours
+            _saved_opens = (real, ours)
+        _watch_depth += 1
+    try:
+        yield
+    finally:
+        with _watch_lock:
+            _watch_depth -= 1
+            if _watch_depth == 0:
+                (real_b, real_io, real_os), (ours_b, ours_io, ours_os) = \
+                    _saved_opens
+                # Leave alone anything someone else swapped in meanwhile.
+                if builtins.open is ours_b:
+                    builtins.open = real_b
+                if io.open is ours_io:
+                    io.open = real_io
+                if os.open is ours_os:
+                    os.open = real_os
+                _saved_opens = None
 
 
 def _file_record(paths, cache_dir):
@@ -373,7 +429,6 @@ class Part:
             result = self.fn(*args, **kwargs)
             _events.append(Event(name, "uncached", time.perf_counter() - t0))
             return result
-        _install_hook()
         arguments = self._bind(args, kwargs)
         t0 = time.perf_counter()
         with _paused():
@@ -398,7 +453,8 @@ class Part:
         frame = _Frame()
         _frames().append(frame)
         try:
-            result = self.fn(*args, **kwargs)
+            with _watching():
+                result = self.fn(*args, **kwargs)
         finally:
             _frames().pop()
         built_s = time.perf_counter() - t0

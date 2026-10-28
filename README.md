@@ -153,7 +153,12 @@ isn't one of its arguments:
   says changes to it won't rebuild the part. Library constants such as
   build123d's `MM` or `math.pi` are skipped.
 - `FileReadWarning`: a part opened a file that isn't an argument. The file
-  is tracked by content either way. The other case is calls to
+  is tracked by content either way. cadcache sees files opened with
+  `open()`, `io.open()`, `os.open()` and anything built on them (pathlib,
+  `json.load(open(...))`) while a part is building; it wraps those only for
+  the length of the build, so code outside parts runs untouched. Opens
+  through `_io.FileIO` directly, or through an `open` a library saved before
+  the build, aren't seen. The other case is calls to
   `import_step`, `import_stl` and similar: OCCT reads those files outside
   Python, where cadcache can't see them, so pass the path as a
   `pathlib.Path` argument.
