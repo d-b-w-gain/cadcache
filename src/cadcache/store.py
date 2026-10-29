@@ -112,7 +112,10 @@ def describe(shape, attributes=()):
                    (getattr(shape, "joints", None) or {}).values()],
     }
     attrs = {}
-    for name in attributes:
+    # A part built inside another keeps its marks, so a hit on the outer
+    # part gives back nested parts that still know their key and part
+    # number, as if each had been called.
+    for name in (*_PART_MARKS, *attributes):
         v = getattr(shape, name, None)
         if v is None:
             continue
@@ -126,6 +129,9 @@ def describe(shape, attributes=()):
     if kids:
         node["children"] = [describe(k, attributes) for k in kids]
     return node
+
+
+_PART_MARKS = ("_cadcache_key", "_cadcache_pn", "_cadcache_name", "_cadcache_loc")
 
 
 def _stored_children(shape):
@@ -293,10 +299,11 @@ def _restore_joint(shape, data):
     shape.joints[j.label] = j
 
 
-def mark(shape, key, part_number=None):
+def mark(shape, key, part_number=None, name=None):
     """Tag a shape a part returned, so passing it to another part keys on
     `key` instead of re-hashing its BREP, and its part number counts as an
     input of that part (until it is moved)."""
     shape._cadcache_key = key
     shape._cadcache_pn = part_number
+    shape._cadcache_name = name
     shape._cadcache_loc = location_values(shape.location)

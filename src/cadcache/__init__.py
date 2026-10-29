@@ -12,4 +12,4 @@ __all__ = ["CacheWarning", "Event", "FileReadWarning", "GlobalReadWarning",
            "register_key",
            "record_effect", "requirements_key", "reset", "run_files",
            "summary"]
-__version__ = "0.5.0"
+__version__ = "0.5.1"

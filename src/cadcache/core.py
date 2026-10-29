@@ -525,7 +525,7 @@ class Part:
             for frame in _frames():
                 frame.update(read)
             _run_files.update(read)
-            store.mark(shape, key, number)
+            store.mark(shape, key, number, name)
             effects = meta.get("effects") or []
             if effects and settings.on_hit is not None and \
                     settings.on_hit(shape, effects) is False:
@@ -567,6 +567,7 @@ class Part:
             reason = settings.validate(result, list(frame.effects))
         if reason is not None:
             result._cadcache_pn = number
+            result._cadcache_name = name
             result._cadcache_loc = keys.location_values(result.location)
             _events.append(Event(name, "uncacheable", built_s, key, number,
                                  reason=str(reason)))
@@ -604,7 +605,7 @@ class Part:
             with _paused():
                 _pending[(brep, side)] = (
                     store.snapshot(result, meta, settings.attributes), result)
-            store.mark(result, key, number)
+            store.mark(result, key, number, name)
             _events.append(Event(name, "built", built_s, key, number,
                                  str(brep)))
             log.info("built %s (%.2fs), entry deferred", name, built_s)
@@ -614,7 +615,7 @@ class Part:
                 settings.before_save(result)
             store.save(result, meta, brep, side, settings.attributes)
             shape = store.load(brep, store.read_sidecar(side))
-        store.mark(shape, key, number)
+        store.mark(shape, key, number, name)
         if frame.effects and settings.rebind is not None:
             settings.rebind(result, shape, list(frame.effects))
         _events.append(Event(name, "built", built_s, key, number, str(brep)))

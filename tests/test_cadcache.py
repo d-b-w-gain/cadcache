@@ -855,6 +855,21 @@ class Effects(Project):
                                         {"made": "inner", "w": 2},
                                         {"made": "inner", "w": 3}])
 
+    def test_nested_parts_keep_their_marks_through_an_outer_hit(self):
+        m = self.module(self.SRC)
+        built = m.outer(2)
+        self.kinds()
+        cached = m.outer(2)
+        self.assertEqual(self.kinds(), {"outer": "cached"})
+        for shape in (built, cached):
+            first, second = shape.children
+            self.assertEqual(first._cadcache_key, m.inner.key(2))
+            self.assertEqual(second._cadcache_key, m.inner.key(3))
+            self.assertEqual(first._cadcache_pn, m.inner.part_number(2))
+            self.assertEqual(first._cadcache_name, "inner")
+            self.assertIsNotNone(second._cadcache_loc)
+        self.assertEqual(cached._cadcache_name, "outer")
+
     def test_on_hit_returning_false_builds_instead(self):
         replays = []
 
